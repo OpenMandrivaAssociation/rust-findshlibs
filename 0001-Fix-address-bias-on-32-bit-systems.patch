@@ -1,0 +1,179 @@
+From 27e72713deb59f7c2e4d6ca06db9e9ff33f24bb4 Mon Sep 17 00:00:00 2001
+From: Jeremy Fitzhardinge <jeremy@goop.org>
+Date: Wed, 27 Nov 2019 21:42:52 -0800
+Subject: [PATCH] Fix address/bias on 32-bit systems
+
+More generally, any platform where library addresses can be in the
+"negative" part of the address space (ie, address MSB is 1).
+
+This consistently uses `usize` for both `Bias` and
+addresses (`Avma`, `Svma`). This assumes `Bias` is always positive, and
+can be very large.
+
+Converting `Avma`/`Svma` to usize makes the address
+arithmetic easier, as it avoids `ptr::offset`, which can take both
+positive and negative offsets, which means it can't offset by more than
+half the address space. It is also undefined for general `*mut u8`
+pointer arithmetic ("Both the starting and resulting pointer must
+be either in bounds or one byte past the end of the same allocated
+object" is not met, nor is "The offset being in bounds cannot rely on
+"wrapping around" the address space. That is, the infinite-precision
+sum, in bytes must fit in a usize").
+
+Fixes issue #47
+---
+ src/lib.rs       | 28 +++++++++++++---------------
+ src/linux/mod.rs |  8 +++-----
+ src/macos/mod.rs | 10 +++++-----
+ 3 files changed, 21 insertions(+), 25 deletions(-)
+
+diff --git a/src/lib.rs b/src/lib.rs
+index 0da499f..63b385c 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -91,7 +91,6 @@ pub mod linux;
+ 
+ use std::ffi::OsStr;
+ use std::fmt::{self, Debug};
+-use std::ptr;
+ 
+ pub mod unsupported;
+ 
+@@ -158,23 +157,23 @@ simple_newtypes! {
+     /// Stated virtual memory address.
+     ///
+     /// See the module documentation for details.
+-    type Svma = *const u8
++    type Svma = usize
+     where
+-        default = ptr::null(),
+-        display = "{:p}";
++        default = 0,
++        display = "{:#x}";
+ 
+     /// Actual virtual memory address.
+     ///
+     /// See the module documentation for details.
+-    type Avma = *const u8
++    type Avma = usize
+     where
+-        default = ptr::null(),
+-        display = "{:p}";
++        default = 0,
++        display = "{:#x}";
+ 
+     /// Virtual memory bias.
+     ///
+     /// See the module documentation for details.
+-    type Bias = isize
++    type Bias = usize
+     where
+         default = 0,
+         display = "{:#x}";
+@@ -214,24 +213,24 @@ pub trait Segment: Sized + Debug {
+     fn actual_virtual_memory_address(&self, shlib: &Self::SharedLibrary) -> Avma {
+         let svma = self.stated_virtual_memory_address();
+         let bias = shlib.virtual_memory_bias();
+-        Avma(unsafe { svma.0.offset(bias.0) })
++        Avma(svma.0 + bias.0 )
+     }
+ 
+     /// Does this segment contain the given address?
+     #[inline]
+     fn contains_svma(&self, address: Svma) -> bool {
+-        let start = self.stated_virtual_memory_address().0 as usize;
++        let start = self.stated_virtual_memory_address().0;
+         let end = start + self.len();
+-        let address = address.0 as usize;
++        let address = address.0;
+         start <= address && address < end
+     }
+ 
+     /// Does this segment contain the given address?
+     #[inline]
+     fn contains_avma(&self, shlib: &Self::SharedLibrary, address: Avma) -> bool {
+-        let start = self.actual_virtual_memory_address(shlib).0 as usize;
++        let start = self.actual_virtual_memory_address(shlib).0;
+         let end = start + self.len();
+-        let address = address.0 as usize;
++        let address = address.0;
+         start <= address && address < end
+     }
+ }
+@@ -312,8 +311,7 @@ pub trait SharedLibrary: Sized + Debug {
+     #[inline]
+     fn avma_to_svma(&self, address: Avma) -> Svma {
+         let bias = self.virtual_memory_bias();
+-        let reverse_bias = -bias.0;
+-        Svma(unsafe { address.0.offset(reverse_bias) })
++        Svma(address.0 - bias.0)
+     }
+ 
+     /// Find all shared libraries in this process and invoke `f` with each one.
+diff --git a/src/linux/mod.rs b/src/linux/mod.rs
+index e56d4a8..b0f60db 100644
+--- a/src/linux/mod.rs
++++ b/src/linux/mod.rs
+@@ -9,7 +9,7 @@ use std::borrow::Cow;
+ use std::env::current_exe;
+ use std::ffi::{CStr, CString, OsStr};
+ use std::fmt;
+-use std::isize;
++use std::usize;
+ use std::marker::PhantomData;
+ use std::mem;
+ use std::os::unix::ffi::OsStrExt;
+@@ -260,8 +260,7 @@ impl<'a> SharedLibraryTrait for SharedLi
+ 
+     #[inline]
+     fn virtual_memory_bias(&self) -> Bias {
+-        assert!((self.addr as usize) < (isize::MAX as usize));
+-        Bias(self.addr as usize as isize)
++        Bias(self.addr as usize)
+     }
+ 
+     #[inline]
+diff --git a/src/macos/mod.rs b/src/macos/mod.rs
+index d3919a0..cb16516 100644
+--- a/src/macos/mod.rs
++++ b/src/macos/mod.rs
+@@ -72,10 +72,10 @@ impl<'a> SegmentTrait for Segment<'a> {
+     #[inline]
+     fn stated_virtual_memory_address(&self) -> Svma {
+         match *self {
+-            Segment::Segment32(seg) => Svma(seg.vmaddr as usize as *const u8),
++            Segment::Segment32(seg) => Svma(seg.vmaddr as usize),
+             Segment::Segment64(seg) => {
+                 assert!(seg.vmaddr <= (usize::MAX as u64));
+-                Svma(seg.vmaddr as usize as *const u8)
++                Svma(seg.vmaddr as usize)
+             }
+         }
+     }
+@@ -198,7 +198,7 @@ impl<'a> MachHeader<'a> {
+ /// `<mach-o/dyld.h>` header.
+ pub struct SharedLibrary<'a> {
+     header: MachHeader<'a>,
+-    slide: isize,
++    slide: usize,
+     name: &'a CStr,
+ }
+ 
+@@ -212,7 +212,7 @@ impl<'a> fmt::Debug for SharedLibrary<'a
+ }
+ 
+ impl<'a> SharedLibrary<'a> {
+-    fn new(header: MachHeader<'a>, slide: isize, name: &'a CStr) -> Self {
++    fn new(header: MachHeader<'a>, slide: usize, name: &'a CStr) -> Self {
+         SharedLibrary {
+             header: header,
+             slide: slide,
+@@ -295,7 +295,7 @@ impl<'a> SharedLibraryTrait for SharedLi
+                 );
+ 
+                 let name = unsafe { CStr::from_ptr(name) };
+-                let shlib = SharedLibrary::new(header, slide, name);
++                let shlib = SharedLibrary::new(header, slide as usize, name);
+ 
+                 match f(&shlib).into() {
+                     IterationControl::Break => break,
